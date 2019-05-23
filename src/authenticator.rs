@@ -1,12 +1,9 @@
-use pam_sys::{
-    acct_mgmt, authenticate, close_session, end, getenv, open_session, putenv, setcred, start,
-};
+use pam_sys::{acct_mgmt, authenticate, close_session, end, open_session, putenv, setcred, start};
 use pam_sys::{PamFlag, PamHandle, PamReturnCode};
-use users;
 
-use std::{env, ptr};
+use std::ptr;
 
-use crate::{env::get_pam_env, ffi, Converse, PamError, PamResult, PasswordConv};
+use crate::{env::get_pam_env, ffi, Converse, PamEnvList, PamError, PamResult, PasswordConv};
 
 /// Main struct to authenticate a user
 ///
@@ -74,8 +71,12 @@ impl<'a, C: Converse> Authenticator<'a, C> {
     }
 
     /// Access the conversation handler of this Authenticator
-    pub fn get_handler(&mut self) -> &mut C {
+    pub fn mut_handler(&mut self) -> &mut C {
         &mut *self.converse
+    }
+
+    pub fn handler(&self) -> &C {
+        &*self.converse
     }
 
     /// Perform the authentication with the provided credentials
@@ -121,61 +122,20 @@ impl<'a, C: Converse> Authenticator<'a, C> {
         }
 
         self.has_open_session = true;
-        self.initialize_environment()
-    }
-
-    // Initialize the client environment with common variables.
-    // Currently always called from Authenticator.open_session()
-    fn initialize_environment(&mut self) -> PamResult<()> {
-        use users::os::unix::UserExt;
-
-        // Set PAM environment in the local process
-        if let Some(mut env_list) = get_pam_env(self.handle) {
-            let env = env_list.to_vec();
-            for (key, value) in env {
-                env::set_var(&key, &value);
-            }
-        }
-
-        let user = users::get_user_by_name(self.converse.username()).unwrap_or_else(|| {
-            panic!("Could not get user by name: {:?}", self.converse.username())
-        });
-
-        // Set some common environment variables
-        self.set_env(
-            "USER",
-            user.name()
-                .to_str()
-                .expect("Unix usernames should be valid UTF-8"),
-        )?;
-        self.set_env(
-            "LOGNAME",
-            user.name()
-                .to_str()
-                .expect("Unix usernames should be valid UTF-8"),
-        )?;
-        self.set_env("HOME", user.home_dir().to_str().unwrap())?;
-        self.set_env("PWD", user.home_dir().to_str().unwrap())?;
-        self.set_env("SHELL", user.shell().to_str().unwrap())?;
-        // Taken from https://github.com/gsingh93/display-manager/blob/master/pam.c
-        // Should be a better way to get this. Revisit later.
-        self.set_env("PATH", "$PATH:/usr/local/sbin:/usr/local/bin:/usr/bin")?;
-
         Ok(())
     }
 
-    // Utility function to set an environment variable in PAM and the process
-    fn set_env(&mut self, key: &str, value: &str) -> PamResult<()> {
-        // Set regular environment variable
-        env::set_var(key, value);
+    pub fn environment(&mut self) -> Option<PamEnvList> {
+        get_pam_env(self.handle)
+    }
 
-        // Set pam environment variable
-        if getenv(self.handle, key).is_none() {
-            let name_value = format!("{}={}", key, value);
-            match putenv(self.handle, &name_value) {
-                PamReturnCode::SUCCESS => Ok(()),
-                code => Err(From::from(code)),
-            }
+    pub fn env<T: AsRef<str>, U: AsRef<str>>(&mut self, name: T, value: U) -> PamResult<()> {
+        let code = putenv(
+            self.handle,
+            &format!("{}={}", name.as_ref(), value.as_ref()),
+        );
+        if code != PamReturnCode::SUCCESS {
+            Err(From::from(code))
         } else {
             Ok(())
         }
