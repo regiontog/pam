@@ -1,13 +1,12 @@
-use libc::{c_char, c_void};
-use pam_sys::{
-    acct_mgmt, authenticate, close_session, end, get_item, open_session, putenv, set_item, setcred,
-    start,
-};
-use pam_sys::{PamFlag, PamHandle, PamItemType, PamReturnCode};
+use pam_sys::{acct_mgmt, authenticate, close_session, end, open_session, putenv, setcred, start};
+use pam_sys::{PamFlag, PamHandle, PamReturnCode};
 
 use std::ptr;
 
-use crate::{env::get_pam_env, env::PamEnvList, ffi, Converse, PamError, PamResult, PasswordConv};
+use crate::{
+    env::get_pam_env, env::PamEnvList, ffi, ConversationHandler, Converse, PamError, PamResult,
+    PasswordConv,
+};
 
 /// Main struct to authenticate a user
 ///
@@ -21,7 +20,7 @@ use crate::{env::get_pam_env, env::PamEnvList, ffi, Converse, PamError, PamResul
 /// let mut authenticator = Authenticator::with_password("system-auth")
 ///         .expect("Failed to init PAM client.");
 /// // Preset the login & password we will use for authentication
-/// authenticator.handler_mut().set_credentials("login", "password");
+/// authenticator.handler_mut().set_credentials("login", "password").unwrap();
 /// // actually try to authenticate:
 /// authenticator.authenticate().expect("Authentication failed!");
 /// // Now that we are authenticated, it's possible to open a sesssion:
@@ -35,11 +34,10 @@ use crate::{env::get_pam_env, env::PamEnvList, ffi, Converse, PamError, PamResul
 ///
 /// By default, the `Authenticator` will close any opened session when dropped. If you don't
 /// want this, you can change its `close_on_drop` field to `False`.
-pub struct Authenticator<'a, C: Converse> {
+pub struct Authenticator<'a, C: Converse<'a>> {
     /// Flag indicating whether the Authenticator should close the session on drop
     pub close_on_drop: bool,
-    handle: &'a mut PamHandle,
-    converse: Box<C>,
+    handler: C::Handler,
     is_authenticated: bool,
     has_open_session: bool,
     last_code: PamReturnCode,
@@ -52,7 +50,7 @@ impl<'a> Authenticator<'a, PasswordConv> {
     }
 }
 
-impl<'a, C: Converse> Authenticator<'a, C> {
+impl<'a, C: Converse<'a>> Authenticator<'a, C> {
     /// Creates a new Authenticator with a given service name and conversation callback
     pub fn with_handler(service: &str, converse: C) -> PamResult<Authenticator<'a, C>> {
         let mut converse = Box::new(converse);
@@ -63,8 +61,7 @@ impl<'a, C: Converse> Authenticator<'a, C> {
             PamReturnCode::SUCCESS => unsafe {
                 Ok(Authenticator {
                     close_on_drop: true,
-                    handle: &mut *handle,
-                    converse,
+                    handler: C::Handler::create(converse, handle.as_mut().unwrap()),
                     is_authenticated: false,
                     has_open_session: false,
                     last_code: PamReturnCode::SUCCESS,
@@ -75,52 +72,22 @@ impl<'a, C: Converse> Authenticator<'a, C> {
     }
 
     pub fn environment(&mut self) -> Option<PamEnvList> {
-        get_pam_env(self.handle)
+        get_pam_env(self.handle_mut())
     }
 
     /// Mutable access to the conversation handler of this Authenticator
-    pub fn handler_mut(&mut self) -> &mut C {
-        &mut *self.converse
+    pub fn handler_mut(&mut self) -> &mut C::Handler {
+        &mut self.handler
     }
 
     /// Immutable access to the conversation handler of this Authenticator
-    pub fn handler(&self) -> &C {
-        &*self.converse
+    pub fn handler(&self) -> &C::Handler {
+        &self.handler
     }
 
     /// Perform the authentication with the provided credentials
     pub fn authenticate(&mut self) -> PamResult<()> {
-        // If PAM_USER item is set(like after an attempted - but failed - authentication) then
-        // PAM won't call the conversation prompt :(
-
-        let mut prompt_ptr = std::ptr::null();
-        self.last_code = get_item(self.handle, PamItemType::USER_PROMPT, &mut prompt_ptr);
-
-        if self.last_code != PamReturnCode::SUCCESS {
-            return Err(From::from(self.last_code));
-        }
-
-        let prompt_ptr = if prompt_ptr.is_null() {
-            None
-        } else {
-            Some(prompt_ptr)
-        };
-
-        if let Ok(login) = self.converse.prompt_echo(
-            prompt_ptr
-                .map(|p| unsafe { std::ffi::CStr::from_ptr(p as *const c_char) })
-                .unwrap_or_else(|| std::ffi::CStr::from_bytes_with_nul(b"login: \0").unwrap()),
-        ) {
-            self.last_code = set_item(self.handle, PamItemType::USER, unsafe {
-                &*(login.as_ptr() as *const c_void)
-            });
-        }
-
-        if self.last_code != PamReturnCode::SUCCESS {
-            return Err(From::from(self.last_code));
-        }
-
-        self.last_code = authenticate(self.handle, PamFlag::NONE);
+        self.last_code = authenticate(self.handle_mut(), PamFlag::NONE);
         if self.last_code != PamReturnCode::SUCCESS {
             // No need to reset here
             return Err(From::from(self.last_code));
@@ -128,7 +95,7 @@ impl<'a, C: Converse> Authenticator<'a, C> {
 
         self.is_authenticated = true;
 
-        self.last_code = acct_mgmt(self.handle, PamFlag::NONE);
+        self.last_code = acct_mgmt(self.handle_mut(), PamFlag::NONE);
         if self.last_code != PamReturnCode::SUCCESS {
             // Probably not strictly neccessary but better be sure
             return self.reset();
@@ -144,18 +111,18 @@ impl<'a, C: Converse> Authenticator<'a, C> {
             return Err(PamReturnCode::PERM_DENIED.into());
         }
 
-        self.last_code = setcred(self.handle, PamFlag::ESTABLISH_CRED);
+        self.last_code = setcred(self.handle_mut(), PamFlag::ESTABLISH_CRED);
         if self.last_code != PamReturnCode::SUCCESS {
             return self.reset();
         }
 
-        self.last_code = open_session(self.handle, PamFlag::NONE);
+        self.last_code = open_session(self.handle_mut(), PamFlag::NONE);
         if self.last_code != PamReturnCode::SUCCESS {
             return self.reset();
         }
 
         // Follow openSSH and call pam_setcred before and after open_session
-        self.last_code = setcred(self.handle, PamFlag::REINITIALIZE_CRED);
+        self.last_code = setcred(self.handle_mut(), PamFlag::REINITIALIZE_CRED);
         if self.last_code != PamReturnCode::SUCCESS {
             return self.reset();
         }
@@ -166,9 +133,10 @@ impl<'a, C: Converse> Authenticator<'a, C> {
 
     pub fn env<T: AsRef<str>, U: AsRef<str>>(&mut self, name: T, value: U) -> PamResult<()> {
         let code = putenv(
-            self.handle,
+            self.handle_mut(),
             &format!("{}={}", name.as_ref(), value.as_ref()),
         );
+
         if code != PamReturnCode::SUCCESS {
             Err(From::from(code))
         } else {
@@ -176,20 +144,28 @@ impl<'a, C: Converse> Authenticator<'a, C> {
         }
     }
 
+    fn handle(&self) -> &PamHandle {
+        C::Handler::handle(&self.handler)
+    }
+
+    fn handle_mut(&mut self) -> &mut PamHandle {
+        C::Handler::handle_mut(&mut self.handler)
+    }
+
     // Utility function to reset the pam handle in case of intermediate errors
     fn reset(&mut self) -> PamResult<()> {
-        setcred(self.handle, PamFlag::DELETE_CRED);
+        setcred(self.handle_mut(), PamFlag::DELETE_CRED);
         self.is_authenticated = false;
         Err(From::from(self.last_code))
     }
 }
 
-impl<'a, C: Converse> Drop for Authenticator<'a, C> {
+impl<'a, C: Converse<'a>> Drop for Authenticator<'a, C> {
     fn drop(&mut self) {
         if self.has_open_session && self.close_on_drop {
-            close_session(self.handle, PamFlag::NONE);
+            close_session(self.handle_mut(), PamFlag::NONE);
         }
-        let code = setcred(self.handle, PamFlag::DELETE_CRED);
-        end(self.handle, code);
+        let code = setcred(self.handle_mut(), PamFlag::DELETE_CRED);
+        end(self.handle_mut(), code);
     }
 }
