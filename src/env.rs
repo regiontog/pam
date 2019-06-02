@@ -1,4 +1,4 @@
-use libc::c_char;
+use libc::{c_char, free};
 use pam_sys::{getenvlist, raw, PamHandle};
 
 use core::iter::FusedIterator;
@@ -8,13 +8,13 @@ pub struct PamEnvList {
     ptr: *const *const c_char,
 }
 
-pub struct IterPamEnv<'a> {
+pub struct PamEnvIter<'a> {
     envs: &'a PamEnvList,
     idx: isize,
     ended: bool,
 }
 
-pub fn get_pam_env(handle: &mut PamHandle) -> Option<PamEnvList> {
+pub(crate) fn get_pam_env(handle: &mut PamHandle) -> Option<PamEnvList> {
     let env = getenvlist(handle);
     if !env.is_null() {
         Some(PamEnvList { ptr: env })
@@ -24,8 +24,8 @@ pub fn get_pam_env(handle: &mut PamHandle) -> Option<PamEnvList> {
 }
 
 impl PamEnvList {
-    pub fn iter(&self) -> IterPamEnv {
-        IterPamEnv {
+    pub fn iter(&self) -> PamEnvIter {
+        PamEnvIter {
             envs: self,
             idx: 0,
             ended: false,
@@ -37,7 +37,7 @@ impl PamEnvList {
     }
 }
 
-impl<'a> Iterator for IterPamEnv<'a> {
+impl<'a> Iterator for PamEnvIter<'a> {
     type Item = &'a CStr;
 
     fn next(&mut self) -> Option<&'a CStr> {
@@ -45,25 +45,35 @@ impl<'a> Iterator for IterPamEnv<'a> {
             return None;
         }
 
-        unsafe {
-            let env_ptr: *const *const c_char = self.envs.ptr.offset(self.idx);
-            self.idx += 1;
+        let env_ptr = unsafe { self.envs.ptr.offset(self.idx) };
+        self.idx += 1;
 
-            if !(*env_ptr).is_null() {
-                Some(CStr::from_ptr(*env_ptr))
-            } else {
-                self.ended = true;
-                None
-            }
+        if env_ptr.is_null() || unsafe { (*env_ptr).is_null() } {
+            self.ended = true;
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(*env_ptr) })
         }
     }
 }
 
-impl FusedIterator for IterPamEnv<'_> {}
+impl FusedIterator for PamEnvIter<'_> {}
 
 #[cfg(target_os = "linux")]
 impl Drop for PamEnvList {
     fn drop(&mut self) {
         unsafe { raw::pam_misc_drop_env(self.ptr as *mut *mut c_char) };
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for PamEnvList {
+    fn drop(&mut self) {
+        let mut ptr = self.ptr;
+        while !ptr.is_null() {
+            unsafe { free(ptr) };
+            ptr = ptr.add(1);
+        }
+        unsafe { free(self.ptr) };
     }
 }

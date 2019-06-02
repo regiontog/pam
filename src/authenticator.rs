@@ -7,7 +7,7 @@ use pam_sys::{PamFlag, PamHandle, PamItemType, PamReturnCode};
 
 use std::ptr;
 
-use crate::{env::get_pam_env, ffi, Converse, PamEnvList, PamError, PamResult, PasswordConv};
+use crate::{env::get_pam_env, env::PamEnvList, ffi, Converse, PamError, PamResult, PasswordConv};
 
 /// Main struct to authenticate a user
 ///
@@ -21,7 +21,7 @@ use crate::{env::get_pam_env, ffi, Converse, PamEnvList, PamError, PamResult, Pa
 /// let mut authenticator = Authenticator::with_password("system-auth")
 ///         .expect("Failed to init PAM client.");
 /// // Preset the login & password we will use for authentication
-/// authenticator.get_handler().set_credentials("login", "password");
+/// authenticator.handler_mut().set_credentials("login", "password");
 /// // actually try to authenticate:
 /// authenticator.authenticate().expect("Authentication failed!");
 /// // Now that we are authenticated, it's possible to open a sesssion:
@@ -31,7 +31,7 @@ use crate::{env::get_pam_env, ffi, Converse, PamEnvList, PamError, PamResult, Pa
 /// If you wish to customise the PAM conversation function, you should rather create your
 /// authenticator with `Authenticator::with_handler`, providing a struct implementing the
 /// `Converse` trait. You can then mutably access your conversation handler using the
-/// `Authenticator::get_handler` method.
+/// `Authenticator::handler_mut` method.
 ///
 /// By default, the `Authenticator` will close any opened session when dropped. If you don't
 /// want this, you can change its `close_on_drop` field to `False`.
@@ -74,11 +74,16 @@ impl<'a, C: Converse> Authenticator<'a, C> {
         }
     }
 
-    /// Access the conversation handler of this Authenticator
-    pub fn mut_handler(&mut self) -> &mut C {
+    pub fn environment(&mut self) -> Option<PamEnvList> {
+        get_pam_env(self.handle)
+    }
+
+    /// Mutable access to the conversation handler of this Authenticator
+    pub fn handler_mut(&mut self) -> &mut C {
         &mut *self.converse
     }
 
+    /// Immutable access to the conversation handler of this Authenticator
     pub fn handler(&self) -> &C {
         &*self.converse
     }
@@ -157,10 +162,6 @@ impl<'a, C: Converse> Authenticator<'a, C> {
 
         self.has_open_session = true;
         Ok(())
-    }
-
-    pub fn environment(&mut self) -> Option<PamEnvList> {
-        get_pam_env(self.handle)
     }
 
     pub fn env<T: AsRef<str>, U: AsRef<str>>(&mut self, name: T, value: U) -> PamResult<()> {
